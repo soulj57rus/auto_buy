@@ -10,3 +10,4 @@ services:
       - "127.0.0.1:6080:6080"
     volumes:
       - ./avito_profile:/app/avito_profile
+      - ./data:/app/data

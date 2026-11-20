@@ -1,11 +1,13 @@
-"""Watch an open Telegram Web chat; click Avito's delivery button, without checkout."""
+"""Watch the Glisa account's listing page and open new Avito offers."""
 
 import asyncio
+import html
+import json
 import logging
 import os
 import re
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from playwright.async_api import async_playwright
 
@@ -13,29 +15,35 @@ from playwright.async_api import async_playwright
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-TARGET_CHAT = os.environ.get("TARGET_CHAT", "glisa_bot").lstrip("@")
 PROFILE_DIR = Path("/app/avito_profile")
-URL_PATTERN = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
+DATA_DIR = Path("/app/data")
+GLISA_URLS = tuple(
+    os.environ.get(f"GLISA_ADLIST_URL_{i}") or (os.environ.get("GLISA_ADLIST_URL") if i == 1 else None)
+    for i in range(1, 4)
+)
+URL_PATTERN = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 DELIVERY_BUTTON_TEXT = re.compile(r"^Купить с доставкой(?:\s|$)", re.IGNORECASE)
-WEB_URL = "https://web.telegram.org/k/"
+LINK_PATH = re.compile(r"^/личныйкабинет/adlist/(\d+)(?:/|$)")
+AD_ID = re.compile(r"_(\d{5,})$")
 
-# Telegram Web K currently uses .bubbles-inner and .bubble[data-mid]. Its HTML
-# is not a public API and can change; fail visibly instead of reading other chats.
-READ_MESSAGES = """() => {
-  const bubbles = [...document.querySelectorAll(
-    '.bubbles-inner:not(.bubbles-remover) .bubble[data-mid][data-peer-id]'
-  )].filter(el => el.getClientRects().length > 0);
-  return {
-    hash: location.hash,
-    messages: bubbles.map(el => ({
-      id: el.dataset.mid,
-      peer: el.dataset.peerId,
-      outgoing: el.classList.contains('is-outgoing') || el.classList.contains('is-out'),
-      text: el.querySelector('.message')?.innerText || '',
-      urls: [...el.querySelectorAll('a[href]')].map(a => a.href)
-    }))
-  };
-}"""
+# Only offer links in the saved-ad table. The search URL above that table is
+# also an Avito URL, but it is NOT an individual offer.
+READ_LIST = """() => ({
+  ready: document.body.innerText.includes('Сохраненные объявления для ссылки'),
+  links: [...document.querySelectorAll('a.adlisthref[href]')].map(a => a.href)
+})"""
+
+
+def list_id(value: str) -> str | None:
+    try:
+        parsed = urlsplit(value)
+        host = (parsed.hostname or "").encode("idna").decode("ascii")
+        match = LINK_PATH.match(unquote(parsed.path))
+        if parsed.scheme in ("http", "https") and host in ("glisa.ru", "xn--80afpl5a.xn--p1ai") and match:
+            return match.group(1)
+    except (ValueError, UnicodeError):
+        pass
+    return None
 
 
 def valid_avito_url(value: str) -> str | None:
@@ -49,16 +57,60 @@ def valid_avito_url(value: str) -> str | None:
     return None
 
 
-def extract_avito_url(message: dict) -> str | None:
-    for value in message["urls"]:
-        url = valid_avito_url(value)
-        if url:
-            return url
-    for match in URL_PATTERN.finditer(message["text"]):
+def offer_key(url: str) -> str:
+    path = urlsplit(url).path
+    match = AD_ID.search(path)
+    return match.group(1) if match else path
+
+
+def extract_notification_url(message: str) -> str | None:
+    # Live Glisa events carry HTML in their `message` field. HTML entities may
+    # encode query strings, so decode before looking for links.
+    for match in URL_PATTERN.finditer(html.unescape(message)):
         url = valid_avito_url(match.group())
-        if url:
+        if url and AD_ID.search(urlsplit(url).path):
             return url
     return None
+
+
+class SeenOffers:
+    def __init__(self, link_id: str):
+        self.link_id = link_id
+        self.state_file = DATA_DIR / f"seen_ads_{link_id}.json"
+        self.ready = False
+        self.keys: set[str] = set()
+        for path in (self.state_file, DATA_DIR / "seen_ads.json"):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if data.get("link_id") == link_id and isinstance(data.get("seen"), list):
+                    self.keys = set(map(str, data["seen"]))
+                    self.ready = True
+                    log.info("Восстановлена история списка %s (%d объявлений).", link_id, len(self.keys))
+                    break
+            except FileNotFoundError:
+                continue
+            except (OSError, ValueError, TypeError):
+                log.exception("Не удалось прочитать историю из %s", path)
+
+    def save(self) -> None:
+        self.state_file.parent.mkdir(parents=True, exist_ok=True)
+        temp_file = self.state_file.with_suffix(".tmp")
+        temp_file.write_text(json.dumps({"link_id": self.link_id, "seen": sorted(self.keys)}), encoding="utf-8")
+        temp_file.replace(self.state_file)
+
+    def add(self, url: str, queue: asyncio.Queue[str], global_keys: set[str]) -> None:
+        key = offer_key(url)
+        if key in self.keys:
+            return
+        self.keys.add(key)
+        # Record before clicking: a failed/partial click must not be retried
+        # indefinitely on every refresh of the listing page.
+        self.save()
+        if key in global_keys:
+            return
+        global_keys.add(key)
+        log.info("Новое объявление в списке %s: %s", self.link_id, url)
+        queue.put_nowait(url)
 
 
 async def click_delivery_button(context, url: str) -> None:
@@ -88,48 +140,84 @@ async def click_delivery_button(context, url: str) -> None:
             await page.close()
 
 
-async def watch_telegram(page, queue: asyncio.Queue[str]) -> None:
-    peer = None
-    chat_hash = None
-    seen: set[str] = set()
-    last_warning = None
-    log.info("Войдите в Telegram Web и откройте чат с @%s в его вкладке.", TARGET_CHAT)
+async def watch_glisa(page, glisa_url: str, queue: asyncio.Queue[str],
+                      seen: SeenOffers, global_keys: set[str],
+                      primary_page=None, primary_id: str | None = None,
+                      login_ready: asyncio.Event | None = None) -> None:
+    expected_id = list_id(glisa_url)
+    if primary_page is not None:
+        # Open secondary lists only after the user logs in on the first tab.
+        await login_ready.wait()
+
+    refresh_soon = asyncio.Event()
+
+    async def on_response(response):
+        try:
+            parsed = urlsplit(response.url)
+            if "/stream-sub/" not in parsed.path or ".b20" in parsed.path or response.status != 200:
+                return
+            data = await response.json()
+            if not isinstance(data, dict) or str(data.get("linkId")) != expected_id:
+                return
+            if not seen.ready:
+                return
+            url = extract_notification_url(str(data.get("message", "")))
+            if url:
+                seen.add(url, queue, global_keys)
+            else:
+                # Some notifications do not include a direct URL; reread table.
+                refresh_soon.set()
+        except Exception:
+            log.exception("Не удалось обработать уведомление Глисы; будет проверена таблица")
+            refresh_soon.set()
+
+    page.on("response", on_response)
+    log.info("Ожидаю список Глисы %s: %s", expected_id, glisa_url)
+    waiting_for_login = False
     while True:
         try:
-            if not page.url.startswith(WEB_URL):
-                raise ValueError("вкладка Telegram Web закрыта или адрес изменён")
-            snapshot = await page.evaluate(READ_MESSAGES)
-            messages = snapshot["messages"]
-            current_hash = snapshot["hash"]
-            peers = {m["peer"] for m in messages}
-            if peer is None:
-                if len(peers) == 1 and current_hash:
-                    peer = peers.pop()
-                    chat_hash = current_hash
-                    seen.update(m["id"] for m in messages)
-                    log.info("Начато наблюдение за открытым чатом (%s). Старые сообщения пропущены.", chat_hash)
-                elif messages and len(peers) != 1 and last_warning != "ambiguous":
-                    log.warning("Не удалось определить один открытый чат; проверьте вкладку Telegram Web.")
-                    last_warning = "ambiguous"
-            elif current_hash not in {chat_hash, f"#@{TARGET_CHAT}", f"#{peer}", f"#/im?p={peer}"} or (peers and peers != {peer}):
-                if last_warning != "switched":
-                    log.warning("Открыт другой чат. Вернитесь к исходному чату @%s; обработка приостановлена.", TARGET_CHAT)
-                    last_warning = "switched"
-            else:
-                last_warning = None
-                for message in messages:
-                    mid = message["id"]
-                    if mid in seen:
+            if list_id(page.url) != expected_id:
+                if "войти" in unquote(urlsplit(page.url).path):
+                    if not waiting_for_login:
+                        log.warning("Список %s: войдите в Глису через http://localhost:6080/vnc.html", expected_id)
+                        waiting_for_login = True
+                    if primary_page is not None and list_id(primary_page.url) == primary_id:
+                        await page.goto(glisa_url, wait_until="domcontentloaded", timeout=60000)
                         continue
-                    seen.add(mid)
-                    if not message["outgoing"]:
-                        url = extract_avito_url(message)
-                        if url:
-                            log.info("Новая ссылка Avito в Telegram Web")
-                            queue.put_nowait(url)
+                    await asyncio.sleep(5)
+                    continue
+                await page.goto(glisa_url, wait_until="domcontentloaded", timeout=60000)
+            snapshot = await page.evaluate(READ_LIST)
+            if not snapshot["ready"]:
+                log.warning("Список %s: таблица объявлений пока не видна; проверю снова", expected_id)
+                await asyncio.sleep(10)
+                await page.reload(wait_until="domcontentloaded", timeout=60000)
+                continue
+
+            waiting_for_login = False
+            if login_ready is not None and primary_page is None:
+                login_ready.set()
+            urls = [url for value in snapshot["links"] if (url := valid_avito_url(value))]
+            if not seen.ready:
+                seen.keys.update(offer_key(url) for url in urls)
+                seen.save()
+                global_keys.update(seen.keys)
+                seen.ready = True
+                log.info("Список %s подключён. %d прежних объявлений пропущено.", expected_id, len(urls))
+            else:
+                for url in reversed(urls):
+                    seen.add(url, queue, global_keys)
+
+            try:
+                await asyncio.wait_for(refresh_soon.wait(), timeout=30)
+                refresh_soon.clear()
+                await asyncio.sleep(2)
+            except asyncio.TimeoutError:
+                pass
+            await page.reload(wait_until="domcontentloaded", timeout=60000)
         except Exception:
-            log.exception("Ошибка чтения Telegram Web; повторю попытку")
-        await asyncio.sleep(2)
+            log.exception("Ошибка чтения списка %s; повторю через 10 секунд", expected_id)
+            await asyncio.sleep(10)
 
 
 async def process_links(context, queue: asyncio.Queue[str]) -> None:
@@ -142,23 +230,34 @@ async def process_links(context, queue: asyncio.Queue[str]) -> None:
 
 
 async def main() -> None:
+    ids = [list_id(url) if url else None for url in GLISA_URLS]
+    if None in ids or len(set(ids)) != 3:
+        raise ValueError("Укажите три РАЗНЫХ адреса списков Глисы в GLISA_ADLIST_URL_1/2/3")
     async with async_playwright() as playwright:
         context = await playwright.chromium.launch_persistent_context(
             user_data_dir=str(PROFILE_DIR), headless=False, args=["--no-sandbox"],
         )
         try:
-            # Use dedicated tabs so opening Avito links cannot navigate the watched chat.
-            telegram = await context.new_page()
+            glisa_pages = [await context.new_page() for _ in GLISA_URLS]
             avito = await context.new_page()
-            for page, address in ((telegram, f"{WEB_URL}#@{TARGET_CHAT}"), (avito, "https://www.avito.ru/")):
+            for page, address in ((glisa_pages[0], GLISA_URLS[0]), (avito, "https://www.avito.ru/")):
                 try:
                     await page.goto(address, wait_until="domcontentloaded", timeout=60000)
                 except Exception as exc:
                     log.warning("Не удалось открыть %s: %s", address, exc)
-            await telegram.bring_to_front()
+            await glisa_pages[0].bring_to_front()
             log.info("Окно браузера: http://localhost:6080/vnc.html")
             queue: asyncio.Queue[str] = asyncio.Queue()
-            await asyncio.gather(watch_telegram(telegram, queue), process_links(context, queue))
+            login_ready = asyncio.Event()
+            histories = [SeenOffers(link_id) for link_id in ids]
+            global_keys = set().union(*(history.keys for history in histories))
+            watchers = [
+                watch_glisa(page, url, queue, histories[i], global_keys,
+                            primary_page=glisa_pages[0] if i else None,
+                            primary_id=ids[0], login_ready=login_ready)
+                for i, (page, url) in enumerate(zip(glisa_pages, GLISA_URLS))
+            ]
+            await asyncio.gather(*watchers, process_links(context, queue))
         finally:
             await context.close()
 
