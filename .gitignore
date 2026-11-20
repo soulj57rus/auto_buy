@@ -1,0 +1,4 @@
+.env
+data/
+avito_profile/
+__pycache__/
