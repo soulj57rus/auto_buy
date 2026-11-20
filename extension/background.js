@@ -74,28 +74,21 @@ async function pump() {
   }
 }
 
-async function handle(message, sender) {
-  if ((message.type === 'activate' || message.type === 'pause') &&
-      sender.url?.startsWith(chrome.runtime.getURL('welcome.html'))) {
-    if (message.type === 'pause') {
-      await chrome.storage.local.set({ ready: false, lastScans: {},
-        lastActivity: 'Мониторинг остановлен вручную' });
-      return { ok: true };
+async function resumePending() {
+  const { pending = {} } = await chrome.storage.local.get('pending');
+  for (const item of Object.values(pending)) {
+    if (item.state !== 'opened' || !item.tabId) continue;
+    try {
+      await chrome.tabs.reload(item.tabId);
+    } catch (_) {
+      item.state = 'waiting';
     }
-    await chrome.storage.local.set({ ready: true });
-    const { pending = {} } = await chrome.storage.local.get('pending');
-    for (const item of Object.values(pending)) {
-      if (item.state !== 'opened' || !item.tabId) continue;
-      try {
-        await chrome.tabs.reload(item.tabId);
-      } catch (_) {
-        item.state = 'waiting';
-      }
-    }
-    await chrome.storage.local.set({ pending, lastActivity: 'Мониторинг запущен' });
-    await pump();
-    return { ok: true };
   }
+  await chrome.storage.local.set({ pending });
+  await pump();
+}
+
+async function handle(message, sender) {
   if (message.type === 'list' || message.type === 'live') {
     const urls = await config();
     if (!urls.some(url => listId(url) === message.listId) || listId(sender.tab?.url) !== message.listId) return;
@@ -173,6 +166,10 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
 
 chrome.runtime.onInstalled.addListener(ensureTabs);
 chrome.runtime.onStartup.addListener(ensureTabs);
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== 'local' || changes.ready?.newValue !== true || changes.ready.oldValue === true) return;
+  serial = serial.then(resumePending).catch(error => console.error('Resume monitoring:', error));
+});
 chrome.tabs.onUpdated.addListener((tabId, change) => {
   if (!change.url || !new URL(change.url).hash.includes('block')) return;
   serial = serial.then(async () => {
