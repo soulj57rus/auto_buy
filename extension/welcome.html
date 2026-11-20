@@ -1,0 +1,13 @@
+<!doctype html><html lang="ru"><meta charset="utf-8"><title>Запуск Глиса → Avito</title>
+<style>body{font:18px sans-serif;max-width:780px;margin:55px auto;line-height:1.5}button{padding:14px 24px;font-size:19px;margin-right:10px}#status{display:block;border-radius:10px;padding:18px 24px;font-size:24px;font-weight:bold}#status.running{background:#d8f3df;color:#155724}#status.stopped{background:#fbdada;color:#8b1d1d}#status.starting{background:#fff1cb;color:#744e00}</style>
+<h1>Глиса → Avito</h1>
+<p>Это обычный Chromium на вашем компьютере: Docker и VNC больше не нужны.</p>
+<ol><li>Во вкладке Avito войдите в аккаунт и убедитесь, что объявления открываются без блокировки.</li>
+<li>Во вкладках Глисы войдите в личный кабинет. Вкладки и Chromium оставьте открытыми.</li>
+<li>Вернитесь сюда и нажмите кнопку ниже, только когда вход в Avito завершён.</li></ol>
+<p>Программа нажимает только «Купить с доставкой». Оформление заказа и оплату выполняют вручную.</p>
+<p id="status" class="stopped" role="status" aria-live="polite">● СТОП — мониторинг остановлен</p>
+<button id="start">Я вошёл в Avito — запустить мониторинг</button>
+<button id="stop">Остановить мониторинг</button>
+<p id="lists"></p><p id="activity"></p>
+<script src="welcome.js"></script></html>

@@ -2,3 +2,6 @@
 data/
 avito_profile/
 __pycache__/
+browser_profile/
+extension/config.json
+browser.log

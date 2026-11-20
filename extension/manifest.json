@@ -1,0 +1,33 @@
+{
+  "manifest_version": 3,
+  "name": "Glisa → Avito",
+  "version": "1.0.0",
+  "description": "Watches three Glisa lists in a regular Chromium browser and opens Avito offers.",
+  "permissions": ["storage", "tabs"],
+  "host_permissions": [
+    "*://glisa.ru/*",
+    "*://*.glisa.ru/*",
+    "*://xn--80afpl5a.xn--p1ai/*",
+    "*://avito.ru/*",
+    "*://www.avito.ru/*"
+  ],
+  "background": { "service_worker": "background.js" },
+  "content_scripts": [
+    {
+      "matches": ["*://glisa.ru/*", "*://*.glisa.ru/*", "*://xn--80afpl5a.xn--p1ai/*"],
+      "js": ["glisa_stream.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": ["*://glisa.ru/*", "*://*.glisa.ru/*", "*://xn--80afpl5a.xn--p1ai/*"],
+      "js": ["glisa.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["*://avito.ru/*", "*://www.avito.ru/*"],
+      "js": ["avito.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
